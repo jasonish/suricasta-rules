@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust with musl target
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: x86_64-unknown-linux-musl
+    
+    - name: Install musl tools
+      run: sudo apt-get update && sudo apt-get install -y musl-tools
+    
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-musl-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Download embedded index
+      run: |
+        mkdir -p embedded
+        curl -sS https://www.openinfosecfoundation.org/rules/index.yaml -o embedded/index.yaml
+        echo "$(date -u +%Y-%m-%dT%H:%M:%S%z)" > embedded/timestamp.txt
+    
+    - name: Check formatting
+      run: cargo fmt -- --check
+    
+    - name: Run clippy
+      run: cargo clippy --target x86_64-unknown-linux-musl -- -D warnings
+    
+    - name: Build
+      run: cargo build --target x86_64-unknown-linux-musl
+    
+    - name: Run tests
+      run: cargo test --target x86_64-unknown-linux-musl
+    
+    - name: Build release
+      if: startsWith(github.ref, 'refs/tags/')
+      run: cargo build --release --target x86_64-unknown-linux-musl
+    
+    - name: Strip binary
+      if: startsWith(github.ref, 'refs/tags/')
+      run: strip target/x86_64-unknown-linux-musl/release/suricasta-rules
+    
+    - name: Rename binary for release
+      if: startsWith(github.ref, 'refs/tags/')
+      run: |
+        mkdir -p release-artifacts
+        cp target/x86_64-unknown-linux-musl/release/suricasta-rules release-artifacts/suricasta-rules-linux-x86_64
+    
+    - name: Upload Linux binary
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-artifact@v4
+      with:
+        name: suricasta-rules-linux-x86_64
+        path: release-artifacts/suricasta-rules-linux-x86_64
+
+  windows:
+    name: Windows Cross-Compilation
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+        targets: x86_64-pc-windows-gnu
+    
+    - name: Install MinGW-w64
+      run: sudo apt-get update && sudo apt-get install -y mingw-w64
+    
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-windows-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-windows-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-windows-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Download embedded index
+      run: |
+        mkdir -p embedded
+        curl -sS https://www.openinfosecfoundation.org/rules/index.yaml -o embedded/index.yaml
+        echo "$(date -u +%Y-%m-%dT%H:%M:%S%z)" > embedded/timestamp.txt
+    
+    - name: Build for Windows
+      run: cargo build --target x86_64-pc-windows-gnu --verbose
+    
+    # Note: Tests cannot run on Linux for Windows target (cross-compilation)
+    
+    - name: Build release for Windows
+      if: startsWith(github.ref, 'refs/tags/')
+      run: cargo build --release --target x86_64-pc-windows-gnu --verbose
+    
+    - name: Strip binary
+      if: startsWith(github.ref, 'refs/tags/')
+      run: x86_64-w64-mingw32-strip target/x86_64-pc-windows-gnu/release/suricasta-rules.exe
+    
+    - name: Rename binary for release
+      if: startsWith(github.ref, 'refs/tags/')
+      run: |
+        mkdir -p release-artifacts
+        cp target/x86_64-pc-windows-gnu/release/suricasta-rules.exe release-artifacts/suricasta-rules-windows-x86_64.exe
+    
+    - name: Upload Windows binary
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-artifact@v4
+      with:
+        name: suricasta-rules-windows-x86_64
+        path: release-artifacts/suricasta-rules-windows-x86_64.exe
+
+  release:
+    name: Create Release
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Download Linux artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: suricasta-rules-linux-x86_64
+        path: release-artifacts/
+    
+    - name: Download Windows artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: suricasta-rules-windows-x86_64
+        path: release-artifacts/
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          release-artifacts/suricasta-rules-linux-x86_64
+          release-artifacts/suricasta-rules-windows-x86_64.exe
+        draft: false
+        prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

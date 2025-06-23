@@ -1,0 +1,30 @@
+[package]
+name = "suricasta-rules"
+license = "AGPL-3.0-only"
+version = "0.1.0-alpha.1"
+edition = "2021"
+description = "Suricata Rule Manager"
+rust-version = "1.82.0"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "color"] }
+colored = "2.1"
+directories = "5.0"
+inquire = "0.7"
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1.0"
+tar = "0.4"
+flate2 = "1.0"
+zip = "2.1"
+md5 = "0.7"
+regex = "1.10"
+chrono = "0.4"
+indicatif = "0.17"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+chrono = "0.4"
