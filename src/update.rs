@@ -87,14 +87,11 @@ impl<'a> UpdateManager<'a> {
         }
 
         // Load source index (it should be fresh after update)
-        let source_index = match source_manager.get_index()? {
-            Some(index) => index,
-            None => {
-                return Err(anyhow::anyhow!(
-                    "No sources index found after updating sources. The index download may have failed."
-                ));
-            }
-        };
+        let source_index = source_manager.get_index()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "No sources index found after updating sources. The index download may have failed."
+            )
+        })?;
 
         // Download and process each enabled source
         let mut all_rules: HashMap<String, Rule> = HashMap::new();

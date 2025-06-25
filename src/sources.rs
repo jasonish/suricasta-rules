@@ -83,6 +83,19 @@ impl<'a> SourceManager<'a> {
         self.read_local_index()
     }
 
+    pub fn get_or_download_index(&self) -> Result<SourceIndex> {
+        match self.get_index()? {
+            Some(index) => Ok(index),
+            None => {
+                println!("No sources index found, downloading...");
+                self.update_sources()?;
+                self.get_index()?.ok_or_else(|| {
+                    anyhow::anyhow!("Failed to retrieve index after updating sources")
+                })
+            }
+        }
+    }
+
     pub fn download_index(&self) -> Result<SourceIndex> {
         let url = self.get_source_index_url();
         println!("Downloading {}", url.cyan());
