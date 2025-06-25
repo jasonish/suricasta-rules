@@ -98,6 +98,17 @@ impl<'a> RulesetManager<'a> {
     }
 
     pub fn enable_source(&self, name: &str, source_info: Option<&SourceInfo>) -> Result<()> {
+        // Check if the ruleset is obsolete
+        if let Some(info) = source_info {
+            if let Some(obsolete_msg) = &info.obsolete {
+                return Err(anyhow::anyhow!(
+                    "Cannot enable obsolete ruleset '{}': {}",
+                    name,
+                    obsolete_msg
+                ));
+            }
+        }
+
         let sources_dir = self.path_provider.sources_dir();
         crate::paths::ensure_dir_exists(&sources_dir)?;
 
@@ -196,7 +207,9 @@ impl<'a> RulesetManager<'a> {
         let mut available_sources: Vec<(&String, &SourceInfo)> = source_index
             .sources
             .iter()
-            .filter(|(_, info)| info.parameters.is_none())
+            .filter(|(_, info)| {
+                info.parameters.is_none() && info.obsolete.is_none() && info.deprecated.is_none()
+            })
             .collect();
 
         available_sources.sort_by_key(|(name, _)| name.as_str());
