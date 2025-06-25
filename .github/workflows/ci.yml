@@ -2,17 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
-    tags:
-      - '[0-9]*.[0-9]*.[0-9]*'
   pull_request:
     branches: [ main ]
 
 permissions:
   contents: write
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
   linux:
@@ -49,12 +43,6 @@ jobs:
         path: target
         key: ${{ runner.os }}-cargo-build-target-musl-${{ hashFiles('**/Cargo.lock') }}
     
-    - name: Download embedded index
-      run: |
-        mkdir -p embedded
-        curl -sS https://www.openinfosecfoundation.org/rules/index.yaml -o embedded/index.yaml
-        echo "$(date -u +%Y-%m-%dT%H:%M:%S%z)" > embedded/timestamp.txt
-    
     - name: Check formatting
       run: cargo fmt -- --check
     
@@ -88,7 +76,7 @@ jobs:
         name: suricasta-rules-linux-x86_64
         path: release-artifacts/suricasta-rules-linux-x86_64
 
-  windows:
+  windows-cross:
     name: Windows Cross-Compilation
     runs-on: ubuntu-latest
     
@@ -122,16 +110,8 @@ jobs:
         path: target
         key: ${{ runner.os }}-cargo-build-target-windows-${{ hashFiles('**/Cargo.lock') }}
     
-    - name: Download embedded index
-      run: |
-        mkdir -p embedded
-        curl -sS https://www.openinfosecfoundation.org/rules/index.yaml -o embedded/index.yaml
-        echo "$(date -u +%Y-%m-%dT%H:%M:%S%z)" > embedded/timestamp.txt
-    
     - name: Build for Windows
       run: cargo build --target x86_64-pc-windows-gnu --verbose
-    
-    # Note: Tests cannot run on Linux for Windows target (cross-compilation)
     
     - name: Build release for Windows
       if: startsWith(github.ref, 'refs/tags/')
@@ -154,9 +134,66 @@ jobs:
         name: suricasta-rules-windows-x86_64
         path: release-artifacts/suricasta-rules-windows-x86_64.exe
 
+  # A rule Windows build job, however we don't use this for the
+  # release binary.
+  windows:
+    name: Windows Build and Test
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+    
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Check formatting
+      run: cargo fmt -- --check
+    
+    - name: Run clippy
+      run: cargo clippy -- -D warnings
+    
+    - name: Build
+      run: cargo build --verbose
+    
+    - name: Run tests
+      run: cargo test --verbose
+
+    - name: Rename debug binary
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path build-artifacts
+        Copy-Item target/debug/suricasta-rules.exe build-artifacts/suricasta-rules-windows-debug-x86_64.exe
+
+    - name: Upload debug binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: suricasta-rules-windows-debug-x86_64
+        path: build-artifacts/suricasta-rules-windows-debug-x86_64.exe
+
+  # Depends on "windows", just to make sure the tests pass.
   release:
     name: Create Release
-    needs: [linux, windows]
+    needs: [linux, windows-cross, windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     
