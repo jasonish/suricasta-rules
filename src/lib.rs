@@ -10,7 +10,10 @@ pub mod update;
 use anyhow::Result;
 
 pub fn run(cli: cli::Cli) -> Result<()> {
-    let path_provider = paths::get_path_provider(cli.user);
+    // If on Windows, always user --user mode for now.
+    let user = cfg!(target_os = "windows") || cli.user;
+
+    let path_provider = paths::get_path_provider(user);
 
     match cli.command {
         cli::Commands::Update { force, quiet } => {
