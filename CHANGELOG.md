@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.0] - 2025-06-25
+
+### Added
+- Validation to prevent enabling obsolete rulesets with clear error messages
+- Filtering of obsolete and deprecated rulesets from interactive selection menu
+
+### Changed
+- Interactive ruleset selection now only displays active, maintained rulesets
+- Users attempting to enable obsolete rulesets receive informative error messages
+
 ## [0.2.0] - 2025-06-25
 
 ### Added
