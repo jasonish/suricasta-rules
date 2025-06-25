@@ -9,15 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 const DEFAULT_INDEX_URL: &str = "https://www.openinfosecfoundation.org/rules/index.yaml";
 const INDEX_FILENAME: &str = "index.yaml";
 const CACHE_MIN_AGE_SECS: i64 = 900; // 15 minutes
-
-// Embedded index data from build time
-const EMBEDDED_INDEX: &str = include_str!(concat!(env!("OUT_DIR"), "/index.yaml"));
-const EMBEDDED_TIMESTAMP: &str = include_str!(concat!(env!("OUT_DIR"), "/index-timestamp.txt"));
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct SourceInfo {
@@ -84,42 +79,8 @@ impl<'a> SourceManager<'a> {
         Ok(Some(index))
     }
 
-    pub fn read_embedded_index(&self) -> Result<SourceIndex> {
-        let index: SourceIndex =
-            serde_yaml::from_str(EMBEDDED_INDEX).context("Failed to parse embedded index")?;
-
-        // Check age of embedded index
-        if let Ok(timestamp) = DateTime::<Utc>::from_str(EMBEDDED_TIMESTAMP.trim()) {
-            let age = Utc::now().signed_duration_since(timestamp);
-            let days = age.num_days();
-
-            if days > 14 {
-                eprintln!(
-                    "{}: Embedded index is {} days old. Consider running 'suricasta-rules update-sources'",
-                    "Warning".yellow(),
-                    days
-                );
-            } else if days > 7 {
-                eprintln!(
-                    "{}: Using embedded index from {} days ago",
-                    "Note".cyan(),
-                    days
-                );
-            }
-        }
-
-        Ok(index)
-    }
-
-    pub fn get_index(&self) -> Result<SourceIndex> {
-        // Try to read local index first
-        if let Some(index) = self.read_local_index()? {
-            return Ok(index);
-        }
-
-        // Fall back to embedded index
-        eprintln!("Info: No local index found, using embedded index");
-        self.read_embedded_index()
+    pub fn get_index(&self) -> Result<Option<SourceIndex>> {
+        self.read_local_index()
     }
 
     pub fn download_index(&self) -> Result<SourceIndex> {

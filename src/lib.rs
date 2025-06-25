@@ -22,7 +22,17 @@ pub fn run(cli: cli::Cli) -> Result<()> {
             let source_manager = sources::SourceManager::new(path_provider.as_ref());
             let ruleset_manager = rulesets::RulesetManager::new(path_provider.as_ref());
 
-            let source_index = source_manager.get_index()?;
+            // Get index, download if missing
+            let source_index = match source_manager.get_index()? {
+                Some(index) => index,
+                None => {
+                    println!("No sources index found, downloading...");
+                    source_manager.update_sources()?;
+                    source_manager
+                        .get_index()?
+                        .expect("Index should exist after update")
+                }
+            };
 
             let source_name = match name {
                 Some(n) => n,
