@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Jason Ish <jason@codemonkey.net>
 
 use crate::paths::PathProvider;
+use crate::user_agent::UserAgent;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use colored::Colorize;
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use tracing::debug;
 
 const DEFAULT_INDEX_URL: &str = "https://www.openinfosecfoundation.org/rules/index.yaml";
 const INDEX_FILENAME: &str = "index.yaml";
@@ -100,8 +102,15 @@ impl<'a> SourceManager<'a> {
         let url = self.get_source_index_url();
         println!("Downloading {}", url.cyan());
 
-        let response = reqwest::blocking::get(&url)
-            .with_context(|| format!("Failed to download from {}", url))?;
+        let user_agent = UserAgent::new().to_string();
+        debug!("Using User-Agent: {}", user_agent);
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(user_agent)
+            .build()?;
+        let response = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("Failed to download from {url}"))?;
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
                 "Failed to download index: HTTP {}",
@@ -222,8 +231,15 @@ impl<'a> SourceManager<'a> {
         let new_index = if quiet {
             // Suppress download message in quiet mode
             let url = self.get_source_index_url();
-            let response = reqwest::blocking::get(&url)
-                .with_context(|| format!("Failed to download from {}", url))?;
+            let user_agent = UserAgent::new().to_string();
+            debug!("Using User-Agent: {}", user_agent);
+            let client = reqwest::blocking::Client::builder()
+                .user_agent(user_agent)
+                .build()?;
+            let response = client
+                .get(&url)
+                .send()
+                .with_context(|| format!("Failed to download from {url}"))?;
             if !response.status().is_success() {
                 return Err(anyhow::anyhow!(
                     "Failed to download index: HTTP {}",

@@ -4,6 +4,7 @@
 use crate::paths::PathProvider;
 use crate::rulesets::RulesetManager;
 use crate::sources::{SourceInfo, SourceManager};
+use crate::user_agent::UserAgent;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use colored::Colorize;
@@ -15,6 +16,7 @@ use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use tar::Archive;
+use tracing::debug;
 use zip::ZipArchive;
 
 const DEFAULT_OUTPUT_FILE: &str = "suricata.rules";
@@ -195,7 +197,7 @@ impl<'a> UpdateManager<'a> {
 
         // Generate cache filename based on URL hash
         let url_hash = format!("{:x}", md5::compute(url.as_bytes()));
-        let cache_filename = format!("{}.tar.gz", url_hash);
+        let cache_filename = format!("{url_hash}.tar.gz");
         let cache_path = self.path_provider.cache_dir().join(&cache_filename);
 
         // Check if we have a recent cache (unless force is specified)
@@ -234,8 +236,15 @@ impl<'a> UpdateManager<'a> {
             println!("  Downloading: {}", url.bright_black());
         }
 
-        let mut response =
-            reqwest::blocking::get(&url).with_context(|| format!("Failed to download {}", url))?;
+        let user_agent = UserAgent::new().to_string();
+        debug!("Using User-Agent: {}", user_agent);
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(user_agent)
+            .build()?;
+        let mut response = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("Failed to download {url}"))?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(

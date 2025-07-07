@@ -6,10 +6,22 @@ pub mod paths;
 pub mod rulesets;
 pub mod sources;
 pub mod update;
+pub mod user_agent;
 
 use anyhow::Result;
 
 pub fn run(cli: cli::Cli) -> Result<()> {
+    // Initialize tracing based on verbosity level
+    let log_level = match cli.verbose {
+        0 => "suricasta_rules=info",
+        1 => "suricasta_rules=debug",
+        _ => "suricasta_rules=trace",
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
+        .init();
+
     // If on Windows, always user --user mode for now.
     let user = cfg!(target_os = "windows") || cli.user;
 

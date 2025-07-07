@@ -16,6 +16,14 @@ pub struct Cli {
     )]
     pub user: bool,
 
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        action = clap::ArgAction::Count,
+        help = "Increase verbosity (can be used multiple times)"
+    )]
+    pub verbose: u8,
+
     #[command(subcommand)]
     pub command: Commands,
 }
