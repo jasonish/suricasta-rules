@@ -8,6 +8,6 @@ check:
     cargo test
 
 fix:
-	cargo clippy --allow-dirty --fix --all-features
-	cargo clippy --target x86_64-pc-windows-gnu --fix --all-features --allow-dirty
-	cargo fmt
+    cargo clippy --allow-dirty --fix --all-features
+    cargo clippy --target x86_64-pc-windows-gnu --fix --all-features --allow-dirty
+    cargo fmt
