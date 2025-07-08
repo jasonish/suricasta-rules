@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1] - 2025-07-07
+
+### Changed
+- Made `-v/--verbose` and `--user` options global, allowing them to be
+  specified before or after sub-commands
+- Add Suricata-Update style user-agent
+
 ## [0.3.0] - 2025-06-25
 
 ### Added
