@@ -9,9 +9,12 @@ use clap::{Parser, Subcommand};
 #[command(about = "Suricata Rule Manager")]
 #[command(version)]
 #[command(styles = get_styles())]
+#[command(args_conflicts_with_subcommands = false)]
+#[command(subcommand_precedence_over_arg = true)]
 pub struct Cli {
     #[arg(
         long,
+        global = true,
         help = "Use user-specific directories instead of system directories"
     )]
     pub user: bool,
@@ -19,6 +22,7 @@ pub struct Cli {
     #[arg(
         short = 'v',
         long = "verbose",
+        global = true,
         action = clap::ArgAction::Count,
         help = "Increase verbosity (can be used multiple times)"
     )]

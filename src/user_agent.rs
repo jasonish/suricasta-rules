@@ -37,7 +37,7 @@ impl UserAgent {
         // Windows-specific distribution detection
         if cfg!(target_os = "windows") {
             if let Some(version) = Self::get_windows_version() {
-                return format!("Windows/{}", version);
+                return format!("Windows/{version}");
             }
             return "Windows".to_string();
         }
