@@ -49,6 +49,11 @@ pub enum Commands {
         force: bool,
         #[arg(short = 'q', long = "quiet", help = "Only output warnings and errors")]
         quiet: bool,
+        #[arg(
+            long = "suricata-version",
+            help = "Suricata version to use when resolving source URLs (auto-detected from suricata -V, falls back to 7.0.0)"
+        )]
+        suricata_version: Option<String>,
     },
 
     #[command(about = "Enable a ruleset")]
@@ -76,7 +81,16 @@ pub fn run(cli: Cli) -> Result<()> {
 
 pub fn run_with_path_provider(command: &Commands, path_provider: &dyn PathProvider) -> Result<()> {
     match command {
-        Commands::Update { force, quiet } => update_rules(path_provider, *force, *quiet),
+        Commands::Update {
+            force,
+            quiet,
+            suricata_version,
+        } => update_rules_with_suricata_version(
+            path_provider,
+            *force,
+            *quiet,
+            suricata_version.as_deref(),
+        ),
         Commands::EnableRuleset { name } => {
             let source_manager = SourceManager::new(path_provider);
             let ruleset_manager = RulesetManager::new(path_provider);

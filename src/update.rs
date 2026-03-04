@@ -66,9 +66,25 @@ impl<'a> UpdateManager<'a> {
     }
 
     fn get_suricata_version() -> String {
-        // TODO: Get actual suricata version by running suricata -V
-        // For now, default to 7.0.0
+        if let Ok(output) = std::process::Command::new("suricata").arg("-V").output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Output looks like: "This is Suricata version 7.0.7 RELEASE"
+                if let Some(version) = Self::parse_suricata_version(&stdout) {
+                    debug!("Detected Suricata version: {}", version);
+                    return version;
+                }
+            }
+        }
+        debug!("Could not detect Suricata version, using default 7.0.0");
         "7.0.0".to_string()
+    }
+
+    fn parse_suricata_version(output: &str) -> Option<String> {
+        let re = Regex::new(r"(\d+\.\d+\.\d+)").ok()?;
+        re.captures(output)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_owned())
     }
 
     pub fn update(&self, force: bool, quiet: bool) -> Result<()> {
