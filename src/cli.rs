@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // SPDX-FileCopyrightText: Copyright 2025 Jason Ish <jason@codemonkey.net>
 
+use crate::paths::PathProvider;
+use crate::rulesets::RulesetManager;
+use crate::sources::SourceManager;
+use crate::update::UpdateManager;
+use anyhow::Result;
 use clap::builder::styling::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 
@@ -58,6 +63,110 @@ pub enum Commands {
     },
     #[command(about = "Update rule sources")]
     UpdateSources,
+}
+
+pub fn run(cli: Cli) -> Result<()> {
+    init_logging(cli.verbose);
+
+    let user = cfg!(target_os = "windows") || cli.user;
+    let path_provider = crate::paths::get_path_provider(user);
+
+    run_with_path_provider(&cli.command, path_provider.as_ref())
+}
+
+pub fn run_with_path_provider(command: &Commands, path_provider: &dyn PathProvider) -> Result<()> {
+    match command {
+        Commands::Update { force, quiet } => update_rules(path_provider, *force, *quiet),
+        Commands::EnableRuleset { name } => {
+            let source_manager = SourceManager::new(path_provider);
+            let ruleset_manager = RulesetManager::new(path_provider);
+
+            let source_index = source_manager.get_or_download_index()?;
+
+            let source_name = match name {
+                Some(n) => n.clone(),
+                None => match ruleset_manager.select_source(&source_index)? {
+                    Some(n) => n,
+                    None => return Ok(()),
+                },
+            };
+
+            let source_info = source_index
+                .sources
+                .get(&source_name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown ruleset: {}", source_name))?;
+
+            ruleset_manager.enable_source(&source_name, Some(source_info))
+        }
+        Commands::DisableRuleset { name } => {
+            let ruleset_manager = RulesetManager::new(path_provider);
+
+            let source_name = match name {
+                Some(n) => n.clone(),
+                None => match ruleset_manager.select_enabled_source()? {
+                    Some(n) => n,
+                    None => return Ok(()),
+                },
+            };
+
+            ruleset_manager.disable_source(&source_name)
+        }
+        Commands::UpdateSources => update_sources(path_provider),
+    }
+}
+
+pub fn update_rules(path_provider: &dyn PathProvider, force: bool, quiet: bool) -> Result<()> {
+    update_rules_with_suricata_version(path_provider, force, quiet, None)
+}
+
+pub fn update_rules_with_suricata_version(
+    path_provider: &dyn PathProvider,
+    force: bool,
+    quiet: bool,
+    suricata_version: Option<&str>,
+) -> Result<()> {
+    let update_manager = UpdateManager::new_with_suricata_version(path_provider, suricata_version);
+    update_manager.update(force, quiet)
+}
+
+pub fn update_sources(path_provider: &dyn PathProvider) -> Result<()> {
+    let source_manager = SourceManager::new(path_provider);
+    source_manager.update_sources()
+}
+
+pub fn enable_ruleset(path_provider: &dyn PathProvider, name: &str) -> Result<()> {
+    let source_manager = SourceManager::new(path_provider);
+    let ruleset_manager = RulesetManager::new(path_provider);
+
+    let source_index = source_manager.get_or_download_index()?;
+    let source_info = source_index
+        .sources
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown ruleset: {}", name))?;
+
+    ruleset_manager.enable_source(name, Some(source_info))
+}
+
+pub fn disable_ruleset(path_provider: &dyn PathProvider, name: &str) -> Result<()> {
+    let ruleset_manager = RulesetManager::new(path_provider);
+    ruleset_manager.disable_source(name)
+}
+
+pub fn enabled_rulesets(path_provider: &dyn PathProvider) -> Result<Vec<String>> {
+    let ruleset_manager = RulesetManager::new(path_provider);
+    ruleset_manager.get_enabled_sources()
+}
+
+pub fn init_logging(verbose: u8) {
+    let log_level = match verbose {
+        0 => "suricasta_rules=info",
+        1 => "suricasta_rules=debug",
+        _ => "suricasta_rules=trace",
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
+        .init();
 }
 
 fn get_styles() -> clap::builder::Styles {

@@ -46,9 +46,22 @@ struct Rule {
 
 impl<'a> UpdateManager<'a> {
     pub fn new(path_provider: &'a dyn PathProvider) -> Self {
+        Self::new_with_suricata_version(path_provider, None)
+    }
+
+    pub fn new_with_suricata_version(
+        path_provider: &'a dyn PathProvider,
+        suricata_version: Option<&str>,
+    ) -> Self {
+        let suricata_version = suricata_version
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(Self::get_suricata_version);
+
         Self {
             path_provider,
-            suricata_version: Self::get_suricata_version(),
+            suricata_version,
         }
     }
 
@@ -258,15 +271,17 @@ impl<'a> UpdateManager<'a> {
         let content_length = response.content_length();
 
         // Create progress bar if we have a TTY and know the content length (and not quiet)
-        let progress_bar = if Self::is_tty() && content_length.is_some() && !quiet {
-            let progress_bar = ProgressBar::new(content_length.unwrap());
-            progress_bar.set_style(
-                ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                    .unwrap()
-                    .progress_chars("#>-")
-            );
-            Some(progress_bar)
+        let progress_bar = if Self::is_tty() && !quiet {
+            content_length.map(|content_length| {
+                let progress_bar = ProgressBar::new(content_length);
+                progress_bar.set_style(
+                    ProgressStyle::default_bar()
+                        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                        .unwrap()
+                        .progress_chars("#>-")
+                );
+                progress_bar
+            })
         } else {
             None
         };
