@@ -11,15 +11,20 @@ use colored::Colorize;
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
+use std::cmp::Reverse;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use tar::Archive;
 use tracing::debug;
 use zip::ZipArchive;
 
 const DEFAULT_OUTPUT_FILE: &str = "suricata.rules";
+const DATASETS_DIR: &str = "datasets";
+const LEGACY_MANAGED_DATASETS_DIR: &str = "suricasta";
 const CACHE_MIN_AGE_SECS: i64 = 900; // 15 minutes
 
 pub struct UpdateManager<'a> {
@@ -33,6 +38,17 @@ struct SourceFile {
     content: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct ProcessedSource {
+    rules: HashMap<String, Rule>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDataset {
+    output_path: PathBuf,
+    content: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 struct Rule {
     raw: String,
@@ -40,6 +56,8 @@ struct Rule {
     sid: u32,
     gid: u32,
     rev: u32,
+    group: String,
+    datasets: Vec<ResolvedDataset>,
     #[allow(dead_code)]
     msg: String,
 }
@@ -131,20 +149,16 @@ impl<'a> UpdateManager<'a> {
 
             if let Some(source_info) = source_index.sources.get(source_name) {
                 match self.process_source(source_name, source_info, force, quiet) {
-                    Ok(rules) => {
+                    Ok(processed) => {
                         info_println!(
                             "  Loaded {} rules from {}",
-                            rules.len().to_string().green(),
+                            processed.rules.len().to_string().green(),
                             source_name.cyan()
                         );
+
                         // Merge rules, preferring higher revision numbers
-                        for (key, rule) in rules {
-                            match all_rules.get(&key) {
-                                Some(existing) if existing.rev >= rule.rev => {}
-                                _ => {
-                                    all_rules.insert(key, rule);
-                                }
-                            }
+                        for (key, rule) in processed.rules {
+                            Self::insert_rule_prefer_newer(&mut all_rules, key, rule);
                         }
                     }
                     Err(e) => {
@@ -165,14 +179,18 @@ impl<'a> UpdateManager<'a> {
             }
         }
 
-        // Write merged rules to output file
+        let all_dataset_files = Self::collect_dataset_files(&all_rules);
+
+        // Write merged rules and datasets to output files
         self.write_rules(&all_rules)?;
+        self.write_dataset_files(&all_dataset_files)?;
 
         info_println!(
-            "\n{}: Wrote {} rules to {}",
+            "\n{}: Wrote {} rules and {} dataset files to {}",
             "Success".green().bold(),
             all_rules.len().to_string().green(),
-            self.get_output_path().display()
+            all_dataset_files.len().to_string().green(),
+            self.path_provider.rules_dir().display()
         );
 
         Ok(())
@@ -189,29 +207,64 @@ impl<'a> UpdateManager<'a> {
         source_info: &SourceInfo,
         force: bool,
         quiet: bool,
-    ) -> Result<HashMap<String, Rule>> {
+    ) -> Result<ProcessedSource> {
         // Download the source
         let archive_path = self.download_source(source_name, source_info, force, quiet)?;
 
-        // Extract rules from archive
+        // Extract files from archive
         let source_files = self.extract_archive(&archive_path)?;
 
-        // Parse rules from extracted files
-        let mut rules = HashMap::new();
+        // Partition source files into dependency files and rule files.
+        let mut dep_files: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        let mut rule_files: Vec<SourceFile> = Vec::new();
         for file in source_files {
-            if std::path::Path::new(&file.filename)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("rules"))
-            {
-                let file_rules = self.parse_rules(&file.content)?;
-                for rule in file_rules {
+            if Self::is_rules_file(&file.filename) {
+                rule_files.push(file);
+            } else if let Some(path) = Self::normalize_relative_path(Path::new(&file.filename)) {
+                dep_files.insert(path, file.content);
+            }
+        }
+
+        // Parse rules and collect dataset files referenced by those rules.
+        let mut rules = HashMap::new();
+
+        for file in rule_files {
+            let file_rules = self.parse_rules(&file.filename, &file.content)?;
+            for rule in file_rules {
+                if let Some((rewritten_rule, rule_datasets)) =
+                    Self::resolve_rule_datasets(source_name, &rule, &dep_files)?
+                {
+                    let mut rule = rule;
+                    rule.raw = rewritten_rule;
+                    rule.datasets = rule_datasets;
                     let key = format!("{}:{}", rule.gid, rule.sid);
-                    rules.insert(key, rule);
+                    Self::insert_rule_prefer_newer(&mut rules, key, rule);
+                } else {
+                    eprintln!(
+                        "{}: Missing dataset file for rule {}:{} (source: {})",
+                        "Warning".yellow(),
+                        rule.gid,
+                        rule.sid,
+                        source_name
+                    );
                 }
             }
         }
 
-        Ok(rules)
+        if !quiet {
+            let dataset_count = rules
+                .values()
+                .flat_map(|r| &r.datasets)
+                .map(|d| &d.output_path)
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            println!(
+                "  Found {} dataset files",
+                dataset_count.to_string().bright_black()
+            );
+        }
+
+        Ok(ProcessedSource { rules })
     }
 
     fn download_source(
@@ -399,7 +452,208 @@ impl<'a> UpdateManager<'a> {
         Ok(files)
     }
 
-    fn parse_rules(&self, content: &[u8]) -> Result<Vec<Rule>> {
+    fn is_rules_file(filename: &str) -> bool {
+        Path::new(filename)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rules"))
+    }
+
+    fn normalize_relative_path(path: &Path) -> Option<PathBuf> {
+        let mut normalized = PathBuf::new();
+
+        for component in path.components() {
+            match component {
+                Component::Normal(part) => normalized.push(part),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !normalized.pop() {
+                        return None;
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => {}
+            }
+        }
+
+        Some(normalized)
+    }
+
+    #[cfg(test)]
+    fn extract_dataset_load_paths(rule: &str) -> Vec<String> {
+        let regex = Self::dataset_load_regex();
+
+        regex
+            .captures_iter(rule)
+            .filter_map(|capture| capture.get(1))
+            .map(|value| {
+                value
+                    .as_str()
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string()
+            })
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
+    fn dataset_load_regex() -> &'static Regex {
+        static DATASET_LOAD_RE: OnceLock<Regex> = OnceLock::new();
+        DATASET_LOAD_RE.get_or_init(|| {
+            Regex::new(r"dataset\s*:[^;]*?\bload\s+([^,\s;]+)").expect("valid regex")
+        })
+    }
+
+    fn path_to_rule_string(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    fn source_dataset_hash_path(source_name: &str, source_dataset_path: &Path) -> PathBuf {
+        let identity = format!(
+            "{}:{}",
+            source_name,
+            Self::path_to_rule_string(source_dataset_path)
+        );
+        let hash = format!("{:x}", md5::compute(identity.as_bytes()));
+        Path::new(DATASETS_DIR).join(hash)
+    }
+
+    fn is_managed_dataset_name(name: &str) -> bool {
+        name.len() == 32 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    fn should_cleanup_dataset_path(relative_path: &Path) -> bool {
+        let Some(filename) = relative_path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+
+        if !Self::is_managed_dataset_name(filename) {
+            return false;
+        }
+
+        match relative_path.parent() {
+            Some(parent) if parent == Path::new(DATASETS_DIR) => true,
+            Some(parent) if parent == Path::new(DATASETS_DIR).join(LEGACY_MANAGED_DATASETS_DIR) => {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn insert_rule_prefer_newer(rules: &mut HashMap<String, Rule>, key: String, rule: Rule) {
+        match rules.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(rule);
+            }
+            Entry::Occupied(mut entry) => {
+                if rule.rev > entry.get().rev {
+                    entry.insert(rule);
+                }
+            }
+        }
+    }
+
+    fn collect_dataset_files(rules: &HashMap<String, Rule>) -> HashMap<PathBuf, Vec<u8>> {
+        let mut dataset_files: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        for rule in rules.values() {
+            for dataset in &rule.datasets {
+                match dataset_files.entry(dataset.output_path.clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(dataset.content.clone());
+                    }
+                    Entry::Occupied(existing) => {
+                        if existing.get() != &dataset.content {
+                            eprintln!(
+                                "{}: Dataset path collision for {} (keeping first file)",
+                                "Warning".yellow(),
+                                existing.key().display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        dataset_files
+    }
+
+    fn resolve_rule_datasets(
+        source_name: &str,
+        rule: &Rule,
+        dep_files: &HashMap<PathBuf, Vec<u8>>,
+    ) -> Result<Option<(String, Vec<ResolvedDataset>)>> {
+        if !rule.enabled {
+            return Ok(Some((rule.raw.clone(), Vec::new())));
+        }
+
+        let mut datasets: Vec<ResolvedDataset> = Vec::new();
+        let mut rewritten_rule = String::with_capacity(rule.raw.len() + 32);
+        let mut cursor = 0;
+
+        for capture in Self::dataset_load_regex().captures_iter(&rule.raw) {
+            let Some(dataset_token_match) = capture.get(1) else {
+                continue;
+            };
+            let dataset_token = dataset_token_match.as_str();
+            let dataset_name = dataset_token
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            if dataset_name.is_empty() {
+                return Ok(None);
+            }
+
+            let dataset_path = Path::new(&dataset_name);
+            if dataset_path.is_absolute() {
+                continue;
+            }
+
+            let prefix = Path::new(&rule.group)
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            let source_filename = prefix.join(dataset_path);
+            let source_filename = match Self::normalize_relative_path(&source_filename) {
+                Some(path) => path,
+                None => return Ok(None),
+            };
+            let content = dep_files.get(&source_filename).cloned();
+
+            if let Some(content) = content {
+                let output_path = Self::source_dataset_hash_path(source_name, &source_filename);
+                let replacement = match (
+                    dataset_token
+                        .strip_prefix('"')
+                        .and_then(|v| v.strip_suffix('"')),
+                    dataset_token
+                        .strip_prefix('\'')
+                        .and_then(|v| v.strip_suffix('\'')),
+                ) {
+                    (Some(_), _) => format!("\"{}\"", Self::path_to_rule_string(&output_path)),
+                    (_, Some(_)) => format!("'{}'", Self::path_to_rule_string(&output_path)),
+                    _ => Self::path_to_rule_string(&output_path),
+                };
+
+                rewritten_rule.push_str(&rule.raw[cursor..dataset_token_match.start()]);
+                rewritten_rule.push_str(&replacement);
+                cursor = dataset_token_match.end();
+
+                datasets.push(ResolvedDataset {
+                    output_path,
+                    content,
+                });
+            } else {
+                return Ok(None);
+            }
+        }
+
+        if cursor == 0 {
+            return Ok(Some((rule.raw.clone(), Vec::new())));
+        }
+
+        rewritten_rule.push_str(&rule.raw[cursor..]);
+        Ok(Some((rewritten_rule, datasets)))
+    }
+
+    fn parse_rules(&self, group: &str, content: &[u8]) -> Result<Vec<Rule>> {
         let content_str = String::from_utf8_lossy(content);
         let mut rules = Vec::new();
 
@@ -452,6 +706,8 @@ impl<'a> UpdateManager<'a> {
                         sid,
                         gid,
                         rev,
+                        group: group.to_string(),
+                        datasets: Vec::new(),
                         msg,
                     });
                 }
@@ -494,7 +750,369 @@ impl<'a> UpdateManager<'a> {
         Ok(())
     }
 
+    fn write_dataset_files(&self, dataset_files: &HashMap<PathBuf, Vec<u8>>) -> Result<()> {
+        for (relative_path, content) in dataset_files {
+            let path = self.path_provider.rules_dir().join(relative_path);
+
+            if let Some(parent) = path.parent() {
+                crate::paths::ensure_dir_exists(parent).with_context(|| {
+                    format!(
+                        "Failed to create dataset directory {}: permission denied",
+                        parent.display()
+                    )
+                })?;
+            }
+
+            fs::write(&path, content).with_context(|| {
+                format!(
+                    "Failed to write dataset file {}: permission denied",
+                    path.display()
+                )
+            })?;
+        }
+
+        let dataset_paths: std::collections::HashSet<&PathBuf> = dataset_files.keys().collect();
+        self.cleanup_unreferenced_dataset_files(&dataset_paths)?;
+
+        Ok(())
+    }
+
+    fn cleanup_unreferenced_dataset_files(
+        &self,
+        dataset_paths: &std::collections::HashSet<&PathBuf>,
+    ) -> Result<()> {
+        let rules_dir = self.path_provider.rules_dir();
+        let datasets_dir = rules_dir.join(DATASETS_DIR);
+        let legacy_datasets_dir = datasets_dir.join(LEGACY_MANAGED_DATASETS_DIR);
+
+        let read_root = match fs::read_dir(&datasets_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to read dataset directory {}",
+                        datasets_dir.display()
+                    )
+                });
+            }
+        };
+
+        for entry in read_root {
+            let entry = entry.with_context(|| {
+                format!(
+                    "Failed to read entry in dataset directory {}",
+                    datasets_dir.display()
+                )
+            })?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("Failed to inspect dataset entry {}", path.display()))?;
+
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let Ok(relative_path) = path.strip_prefix(&rules_dir).map(Path::to_path_buf) else {
+                continue;
+            };
+
+            if !dataset_paths.contains(&relative_path)
+                && Self::should_cleanup_dataset_path(&relative_path)
+            {
+                fs::remove_file(&path).with_context(|| {
+                    format!("Failed to remove unreferenced dataset {}", path.display())
+                })?;
+            }
+        }
+
+        let mut dirs = Vec::new();
+        let mut stack = vec![legacy_datasets_dir.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let read_dir = match fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("Failed to read dataset directory {}", dir.display())
+                    });
+                }
+            };
+            dirs.push(dir.clone());
+            for entry in read_dir {
+                let entry = entry.with_context(|| {
+                    format!(
+                        "Failed to read entry in dataset directory {}",
+                        dir.display()
+                    )
+                })?;
+                let path = entry.path();
+                let file_type = entry.file_type().with_context(|| {
+                    format!("Failed to inspect dataset entry {}", path.display())
+                })?;
+
+                if file_type.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+
+                if !file_type.is_file() {
+                    continue;
+                }
+
+                let Ok(relative_path) = path.strip_prefix(&rules_dir).map(Path::to_path_buf) else {
+                    continue;
+                };
+
+                if !dataset_paths.contains(&relative_path)
+                    && Self::should_cleanup_dataset_path(&relative_path)
+                {
+                    fs::remove_file(&path).with_context(|| {
+                        format!("Failed to remove unreferenced dataset {}", path.display())
+                    })?;
+                }
+            }
+        }
+
+        dirs.sort_by_key(|dir| Reverse(dir.components().count()));
+        for dir in dirs {
+            let mut entries = fs::read_dir(&dir)
+                .with_context(|| format!("Failed to read dataset directory {}", dir.display()))?;
+            if entries.next().is_none() {
+                fs::remove_dir(&dir).with_context(|| {
+                    format!("Failed to remove empty dataset directory {}", dir.display())
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn get_output_path(&self) -> PathBuf {
         self.path_provider.rules_dir().join(DEFAULT_OUTPUT_FILE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Rule, UpdateManager};
+    use crate::paths::PathProvider;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestPaths {
+        root: PathBuf,
+    }
+
+    impl PathProvider for TestPaths {
+        fn sources_dir(&self) -> PathBuf {
+            self.root.join("sources")
+        }
+
+        fn cache_dir(&self) -> PathBuf {
+            self.root.join("cache")
+        }
+
+        fn rules_dir(&self) -> PathBuf {
+            self.root.join("rules")
+        }
+    }
+
+    #[test]
+    fn test_extract_dataset_load_paths() {
+        let rule = r#"alert dns any any -> any any (msg:"test"; dataset:isset,myset,type string,load foo.lst; sid:1; rev:1;)"#;
+        let paths = UpdateManager::extract_dataset_load_paths(rule);
+        assert_eq!(paths, vec!["foo.lst"]);
+    }
+
+    #[test]
+    fn test_normalize_relative_path() {
+        let normalized =
+            UpdateManager::normalize_relative_path(Path::new("rules/../lists/pawpatrules.lst"));
+        assert_eq!(normalized.unwrap(), Path::new("lists/pawpatrules.lst"));
+
+        let escaped = UpdateManager::normalize_relative_path(Path::new("../../evil.lst"));
+        assert!(escaped.is_none());
+    }
+
+    #[test]
+    fn test_source_dataset_hash_path_differs_by_source() {
+        let source_dataset_path = Path::new("rules/foo.lst");
+        let first = UpdateManager::source_dataset_hash_path("et/open", source_dataset_path);
+        let second = UpdateManager::source_dataset_hash_path("pt/rules", source_dataset_path);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_resolve_rule_datasets_rewrites_load_path() {
+        let rule = Rule {
+            raw: r#"alert dns any any -> any any (msg:"test"; dataset:isset,myset,type string,load foo.lst; sid:1; rev:1;)"#.to_string(),
+            enabled: true,
+            sid: 1,
+            gid: 1,
+            rev: 1,
+            group: "rules/test.rules".to_string(),
+            datasets: Vec::new(),
+            msg: "test".to_string(),
+        };
+
+        let mut dep_files = HashMap::new();
+        dep_files.insert(PathBuf::from("rules/foo.lst"), b"one\ntwo\n".to_vec());
+
+        let (rewritten, datasets) =
+            UpdateManager::resolve_rule_datasets("et/open", &rule, &dep_files)
+                .unwrap()
+                .unwrap();
+
+        let expected_path =
+            UpdateManager::source_dataset_hash_path("et/open", Path::new("rules/foo.lst"));
+        assert_eq!(datasets.len(), 1);
+        assert_eq!(datasets[0].output_path, expected_path);
+        assert_eq!(datasets[0].content, b"one\ntwo\n".to_vec());
+        assert!(rewritten.contains(&format!(
+            "load {}",
+            UpdateManager::path_to_rule_string(&expected_path)
+        )));
+        assert!(!rewritten.contains("load foo.lst"));
+    }
+
+    #[test]
+    fn test_resolve_rule_datasets_keeps_absolute_load_path() {
+        let rule = Rule {
+            raw: r#"alert dns any any -> any any (msg:"test"; dataset:isset,myset,type string,load /etc/shadow; sid:1; rev:1;)"#.to_string(),
+            enabled: true,
+            sid: 1,
+            gid: 1,
+            rev: 1,
+            group: "rules/test.rules".to_string(),
+            datasets: Vec::new(),
+            msg: "test".to_string(),
+        };
+
+        let (rewritten, datasets) =
+            UpdateManager::resolve_rule_datasets("et/open", &rule, &HashMap::new())
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(rewritten, rule.raw);
+        assert!(datasets.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_rule_datasets_rewrites_relative_and_keeps_absolute_paths() {
+        let rule = Rule {
+            raw: r#"alert dns any any -> any any (msg:"test"; dataset:isset,myset,type string,load foo.lst; dataset:isset,otherset,type string,load /etc/shadow; sid:1; rev:1;)"#.to_string(),
+            enabled: true,
+            sid: 1,
+            gid: 1,
+            rev: 1,
+            group: "rules/test.rules".to_string(),
+            datasets: Vec::new(),
+            msg: "test".to_string(),
+        };
+
+        let mut dep_files = HashMap::new();
+        dep_files.insert(PathBuf::from("rules/foo.lst"), b"one\ntwo\n".to_vec());
+
+        let (rewritten, datasets) =
+            UpdateManager::resolve_rule_datasets("et/open", &rule, &dep_files)
+                .unwrap()
+                .unwrap();
+
+        let expected_path =
+            UpdateManager::source_dataset_hash_path("et/open", Path::new("rules/foo.lst"));
+        assert_eq!(datasets.len(), 1);
+        assert_eq!(datasets[0].output_path, expected_path);
+        assert_eq!(datasets[0].content, b"one\ntwo\n".to_vec());
+        assert!(rewritten.contains(&format!(
+            "load {}",
+            UpdateManager::path_to_rule_string(&expected_path)
+        )));
+        assert!(rewritten.contains("load /etc/shadow"));
+    }
+
+    #[test]
+    fn test_collect_dataset_files_uses_winning_rule() {
+        let mut rules = HashMap::new();
+
+        let old_rule_dataset_path =
+            UpdateManager::source_dataset_hash_path("source-old", Path::new("rules/foo.lst"));
+        let new_rule_dataset_path =
+            UpdateManager::source_dataset_hash_path("source-new", Path::new("rules/foo.lst"));
+
+        let old_rule = Rule {
+            raw: "alert ip any any -> any any (msg:\"old\"; sid:100; rev:1;)".to_string(),
+            enabled: true,
+            sid: 100,
+            gid: 1,
+            rev: 1,
+            group: "rules/old.rules".to_string(),
+            datasets: vec![super::ResolvedDataset {
+                output_path: old_rule_dataset_path,
+                content: b"old".to_vec(),
+            }],
+            msg: "old".to_string(),
+        };
+
+        let new_rule = Rule {
+            raw: "alert ip any any -> any any (msg:\"new\"; sid:100; rev:2;)".to_string(),
+            enabled: true,
+            sid: 100,
+            gid: 1,
+            rev: 2,
+            group: "rules/new.rules".to_string(),
+            datasets: vec![super::ResolvedDataset {
+                output_path: new_rule_dataset_path.clone(),
+                content: b"new".to_vec(),
+            }],
+            msg: "new".to_string(),
+        };
+
+        UpdateManager::insert_rule_prefer_newer(&mut rules, "1:100".to_string(), old_rule);
+        UpdateManager::insert_rule_prefer_newer(&mut rules, "1:100".to_string(), new_rule);
+
+        let dataset_files = UpdateManager::collect_dataset_files(&rules);
+        assert_eq!(dataset_files.len(), 1);
+        assert_eq!(
+            dataset_files.get(&new_rule_dataset_path),
+            Some(&b"new".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_write_dataset_files_only_cleans_managed_datasets() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("suricasta-rules-test-{unique}"));
+        let paths = TestPaths { root: root.clone() };
+        let manager = UpdateManager::new_with_suricata_version(&paths, Some("7.0.0"));
+
+        let keep_rel = PathBuf::from("datasets/73905fd347807b03eec25846be7bd554");
+        let stale_rel = PathBuf::from("datasets/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let unmanaged_rel = PathBuf::from("datasets/local.lst");
+
+        fs::create_dir_all(paths.rules_dir().join("datasets")).unwrap();
+        fs::write(paths.rules_dir().join(&stale_rel), b"stale").unwrap();
+        fs::write(paths.rules_dir().join(&unmanaged_rel), b"outside datasets").unwrap();
+
+        let mut dataset_files = HashMap::new();
+        dataset_files.insert(keep_rel.clone(), b"keep".to_vec());
+
+        manager.write_dataset_files(&dataset_files).unwrap();
+
+        assert_eq!(
+            fs::read(paths.rules_dir().join(&keep_rel)).unwrap(),
+            b"keep".to_vec()
+        );
+        assert!(!paths.rules_dir().join(&stale_rel).exists());
+        assert!(paths.rules_dir().join(&unmanaged_rel).exists());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }
