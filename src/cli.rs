@@ -7,7 +7,7 @@ use crate::sources::SourceManager;
 use crate::update::UpdateManager;
 use anyhow::Result;
 use clap::builder::styling::{AnsiColor, Color, Style};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "suricasta-rules")]
@@ -54,6 +54,20 @@ pub enum Commands {
             help = "Suricata version to use when resolving source URLs (auto-detected from suricata -V, falls back to 7.0.0)"
         )]
         suricata_version: Option<String>,
+        #[arg(
+            long = "disable-regex",
+            value_name = "REGEX",
+            action = ArgAction::Append,
+            help = "Remove final rules whose full text matches this regular expression"
+        )]
+        disable_regex: Vec<String>,
+        #[arg(
+            long = "disable-substring",
+            value_name = "TEXT",
+            action = ArgAction::Append,
+            help = "Remove final rules whose full text contains this substring"
+        )]
+        disable_substring: Vec<String>,
     },
 
     #[command(about = "Enable a ruleset")]
@@ -85,11 +99,15 @@ pub fn run_with_path_provider(command: &Commands, path_provider: &dyn PathProvid
             force,
             quiet,
             suricata_version,
-        } => update_rules_with_suricata_version(
+            disable_regex,
+            disable_substring,
+        } => update_rules_with_options(
             path_provider,
             *force,
             *quiet,
             suricata_version.as_deref(),
+            disable_regex,
+            disable_substring,
         ),
         Commands::EnableRuleset { name } => {
             let source_manager = SourceManager::new(path_provider);
@@ -130,7 +148,7 @@ pub fn run_with_path_provider(command: &Commands, path_provider: &dyn PathProvid
 }
 
 pub fn update_rules(path_provider: &dyn PathProvider, force: bool, quiet: bool) -> Result<()> {
-    update_rules_with_suricata_version(path_provider, force, quiet, None)
+    update_rules_with_options(path_provider, force, quiet, None, &[], &[])
 }
 
 pub fn update_rules_with_suricata_version(
@@ -139,8 +157,19 @@ pub fn update_rules_with_suricata_version(
     quiet: bool,
     suricata_version: Option<&str>,
 ) -> Result<()> {
+    update_rules_with_options(path_provider, force, quiet, suricata_version, &[], &[])
+}
+
+pub fn update_rules_with_options(
+    path_provider: &dyn PathProvider,
+    force: bool,
+    quiet: bool,
+    suricata_version: Option<&str>,
+    disable_regexes: &[String],
+    disable_substrings: &[String],
+) -> Result<()> {
     let update_manager = UpdateManager::new_with_suricata_version(path_provider, suricata_version);
-    update_manager.update(force, quiet)
+    update_manager.update(force, quiet, disable_regexes, disable_substrings)
 }
 
 pub fn update_sources(path_provider: &dyn PathProvider) -> Result<()> {
@@ -212,4 +241,37 @@ fn get_styles() -> clap::builder::Styles {
                 .bold()
                 .fg_color(Some(Color::Ansi(AnsiColor::Red))),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn test_update_command_parses_disable_filters() {
+        let cli = Cli::try_parse_from([
+            "suricasta-rules",
+            "update",
+            "--disable-regex",
+            "foo.*bar",
+            "--disable-regex",
+            "sid:\\s*1001",
+            "--disable-substring",
+            "drop tcp",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Update {
+                disable_regex,
+                disable_substring,
+                ..
+            } => {
+                assert_eq!(disable_regex, vec!["foo.*bar", r"sid:\s*1001"]);
+                assert_eq!(disable_substring, vec!["drop tcp"]);
+            }
+            _ => panic!("expected update command"),
+        }
+    }
 }

@@ -62,6 +62,41 @@ struct Rule {
     msg: String,
 }
 
+#[derive(Debug, Default)]
+struct RuleFilters {
+    regexes: Vec<Regex>,
+    substrings: Vec<String>,
+}
+
+impl RuleFilters {
+    fn new(regex_patterns: &[String], substrings: &[String]) -> Result<Self> {
+        let regexes = regex_patterns
+            .iter()
+            .map(|pattern| {
+                Regex::new(pattern)
+                    .with_context(|| format!("Invalid --disable-regex pattern: {pattern}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            regexes,
+            substrings: substrings.to_vec(),
+        })
+    }
+
+    fn matches(&self, rule: &Rule) -> bool {
+        rule.enabled
+            && (self
+                .substrings
+                .iter()
+                .any(|pattern| rule.raw.contains(pattern))
+                || self
+                    .regexes
+                    .iter()
+                    .any(|pattern| pattern.is_match(&rule.raw)))
+    }
+}
+
 impl<'a> UpdateManager<'a> {
     pub fn new(path_provider: &'a dyn PathProvider) -> Self {
         Self::new_with_suricata_version(path_provider, None)
@@ -105,7 +140,13 @@ impl<'a> UpdateManager<'a> {
             .map(|m| m.as_str().to_owned())
     }
 
-    pub fn update(&self, force: bool, quiet: bool) -> Result<()> {
+    pub fn update(
+        &self,
+        force: bool,
+        quiet: bool,
+        disable_regexes: &[String],
+        disable_substrings: &[String],
+    ) -> Result<()> {
         // Macro for conditional printing (only print if not quiet)
         macro_rules! info_println {
             ($($arg:tt)*) => {
@@ -114,6 +155,8 @@ impl<'a> UpdateManager<'a> {
                 }
             };
         }
+
+        let rule_filters = RuleFilters::new(disable_regexes, disable_substrings)?;
 
         info_println!("{}", "Running Suricata rule update...".green().bold());
 
@@ -177,6 +220,14 @@ impl<'a> UpdateManager<'a> {
                     source_name
                 );
             }
+        }
+
+        let filtered_rule_count = Self::filter_rules(&mut all_rules, &rule_filters);
+        if filtered_rule_count > 0 {
+            info_println!(
+                "\nFiltered {} rules from the final ruleset",
+                filtered_rule_count.to_string().yellow()
+            );
         }
 
         let all_dataset_files = Self::collect_dataset_files(&all_rules);
@@ -470,7 +521,7 @@ impl<'a> UpdateManager<'a> {
                         return None;
                     }
                 }
-                Component::RootDir | Component::Prefix(_) => {}
+                Component::RootDir | Component::Prefix(_) => return None,
             }
         }
 
@@ -505,6 +556,10 @@ impl<'a> UpdateManager<'a> {
 
     fn path_to_rule_string(path: &Path) -> String {
         path.to_string_lossy().replace('\\', "/")
+    }
+
+    fn is_absolute_or_rooted_path(path: &Path) -> bool {
+        path.is_absolute() || path.has_root()
     }
 
     fn source_dataset_hash_path(source_name: &str, source_dataset_path: &Path) -> PathBuf {
@@ -550,6 +605,12 @@ impl<'a> UpdateManager<'a> {
                 }
             }
         }
+    }
+
+    fn filter_rules(rules: &mut HashMap<String, Rule>, filters: &RuleFilters) -> usize {
+        let original_len = rules.len();
+        rules.retain(|_, rule| !filters.matches(rule));
+        original_len.saturating_sub(rules.len())
     }
 
     fn collect_dataset_files(rules: &HashMap<String, Rule>) -> HashMap<PathBuf, Vec<u8>> {
@@ -603,7 +664,7 @@ impl<'a> UpdateManager<'a> {
             }
 
             let dataset_path = Path::new(&dataset_name);
-            if dataset_path.is_absolute() {
+            if Self::is_absolute_or_rooted_path(dataset_path) {
                 continue;
             }
 
@@ -897,7 +958,7 @@ impl<'a> UpdateManager<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rule, UpdateManager};
+    use super::{ResolvedDataset, Rule, RuleFilters, UpdateManager};
     use crate::paths::PathProvider;
     use std::collections::HashMap;
     use std::fs;
@@ -937,6 +998,9 @@ mod tests {
 
         let escaped = UpdateManager::normalize_relative_path(Path::new("../../evil.lst"));
         assert!(escaped.is_none());
+
+        let absolute = UpdateManager::normalize_relative_path(Path::new("/etc/shadow"));
+        assert!(absolute.is_none());
     }
 
     #[test]
@@ -1051,7 +1115,7 @@ mod tests {
             gid: 1,
             rev: 1,
             group: "rules/old.rules".to_string(),
-            datasets: vec![super::ResolvedDataset {
+            datasets: vec![ResolvedDataset {
                 output_path: old_rule_dataset_path,
                 content: b"old".to_vec(),
             }],
@@ -1065,7 +1129,7 @@ mod tests {
             gid: 1,
             rev: 2,
             group: "rules/new.rules".to_string(),
-            datasets: vec![super::ResolvedDataset {
+            datasets: vec![ResolvedDataset {
                 output_path: new_rule_dataset_path.clone(),
                 content: b"new".to_vec(),
             }],
@@ -1081,6 +1145,100 @@ mod tests {
             dataset_files.get(&new_rule_dataset_path),
             Some(&b"new".to_vec())
         );
+    }
+
+    #[test]
+    fn test_filter_rules_removes_substring_matches() {
+        let dataset_path =
+            UpdateManager::source_dataset_hash_path("et/open", Path::new("rules/foo.lst"));
+        let mut rules = HashMap::from([
+            (
+                "1:100".to_string(),
+                Rule {
+                    raw: "alert ip any any -> any any (msg:\"keep\"; sid:100; rev:1;)".to_string(),
+                    enabled: true,
+                    sid: 100,
+                    gid: 1,
+                    rev: 1,
+                    group: "rules/test.rules".to_string(),
+                    datasets: Vec::new(),
+                    msg: "keep".to_string(),
+                },
+            ),
+            (
+                "1:200".to_string(),
+                Rule {
+                    raw: "alert ip any any -> any any (msg:\"block me\"; sid:200; rev:1;)"
+                        .to_string(),
+                    enabled: true,
+                    sid: 200,
+                    gid: 1,
+                    rev: 1,
+                    group: "rules/test.rules".to_string(),
+                    datasets: vec![ResolvedDataset {
+                        output_path: dataset_path.clone(),
+                        content: b"blocked".to_vec(),
+                    }],
+                    msg: "block me".to_string(),
+                },
+            ),
+        ]);
+
+        let filters = RuleFilters::new(&[], &["block me".to_string()]).unwrap();
+        let removed = UpdateManager::filter_rules(&mut rules, &filters);
+
+        assert_eq!(removed, 1);
+        assert_eq!(rules.len(), 1);
+        assert!(!rules.contains_key("1:200"));
+        assert!(UpdateManager::collect_dataset_files(&rules).is_empty());
+    }
+
+    #[test]
+    fn test_filter_rules_removes_regex_matches() {
+        let mut rules = HashMap::from([
+            (
+                "1:100".to_string(),
+                Rule {
+                    raw: "alert ip any any -> any any (msg:\"keep\"; sid:100; rev:1;)".to_string(),
+                    enabled: true,
+                    sid: 100,
+                    gid: 1,
+                    rev: 1,
+                    group: "rules/test.rules".to_string(),
+                    datasets: Vec::new(),
+                    msg: "keep".to_string(),
+                },
+            ),
+            (
+                "1:200".to_string(),
+                Rule {
+                    raw: "alert ip any any -> any any (msg:\"drop me\"; sid:200; rev:1;)"
+                        .to_string(),
+                    enabled: true,
+                    sid: 200,
+                    gid: 1,
+                    rev: 1,
+                    group: "rules/test.rules".to_string(),
+                    datasets: Vec::new(),
+                    msg: "drop me".to_string(),
+                },
+            ),
+        ]);
+
+        let filters = RuleFilters::new(&[r"sid:\s*200".to_string()], &[]).unwrap();
+        let removed = UpdateManager::filter_rules(&mut rules, &filters);
+
+        assert_eq!(removed, 1);
+        assert_eq!(rules.len(), 1);
+        assert!(!rules.contains_key("1:200"));
+    }
+
+    #[test]
+    fn test_rule_filters_reject_invalid_regex() {
+        let err = RuleFilters::new(&["(".to_string()], &[]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Invalid --disable-regex pattern: ("));
     }
 
     #[test]
